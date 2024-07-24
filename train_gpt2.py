@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
+import math
 
 
 @dataclass
@@ -13,14 +13,14 @@ class Config:
     n_head: int = 12
     n_embd: int = 768
 
-class CausalSelfAttention(nn.Moduel):
+class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
-        self.c_attn = nn.Linear(config.embd, 3 * config.embd)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
 
-        self.c_proj = nn.Linear(3 * config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -36,25 +36,25 @@ class CausalSelfAttention(nn.Moduel):
         q = q.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
-
+        # print(f"q: {q[0, 0]}\n k: {k[0, 0]}\n v: {v[0, 0]}")
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim = 1)
-    
+        att = F.softmax(att, dim = -1)
+        # print(f"att: {att[0, 0]}")
         y = att @ v
-        
+        # print(f"y: {y[0, 0]}")
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
     
     
 
-class MLP(nn.Moudle):
+class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(4 * config.embd, config.embd)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
@@ -88,3 +88,83 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd)
         )))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.size()
+
+        assert T <= self.config.block_size
+       
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.transformer.wte(idx)
+        x = tok_emb + pos_emb
+        # print(f"input {x}")
+        for block in self.transformer.h:
+            x = block(x)
+        # print(f"after blocks {x}")
+        x = self.transformer.ln_f(x)
+        # print(x)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        # print(logits)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+    
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+with open('input.txt') as f:
+    text = f.read()
+data = text[:1000]
+
+import tiktoken
+
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode(data)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1]).to(device)
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+
+model = GPT(Config())
+model.eval()
+model.to(device)
+
+logits, loss = model(x, y)
+print(loss)
+
+# sd = model.state_dict()
+
+# for k, v in sd.items():
+#     print(v)
+#     break
+
+import sys; sys.exit(0)
+
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+x = tokens.to('cuda')
+
+while x.size(1) < 30:
+    with torch.no_grad():
+        
+        logits = model(x)# (B, T, vocab_size)
+        
+        logits = logits[:, -1, :]
+    
+        probs = F.softmax(logits, dim=-1)
+
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        print(topk_probs)
+        ix = torch.multinomial(topk_probs, 1)
+
+        xcol = torch.gather(topk_indices, -1, ix)
+
+        x = torch.cat((x, xcol), dim=1)
+
+for i in range(5):
+    tokens = x[i, :30].tolist()
+    decoded = tokenizer.decode(tokens)
+    print(">",decoded)
