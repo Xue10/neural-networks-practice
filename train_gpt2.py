@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import time
 
 
 @dataclass
@@ -21,7 +22,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
 
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
@@ -37,11 +38,12 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
         # print(f"q: {q[0, 0]}\n k: {k[0, 0]}\n v: {v[0, 0]}")
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim = -1)
-        # print(f"att: {att[0, 0]}")
-        y = att @ v
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim = -1)
+        # # print(f"att: {att[0, 0]}")
+        # y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         # print(f"y: {y[0, 0]}")
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -55,6 +57,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
@@ -88,6 +91,20 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd)
         )))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+    def _init_weights(self, module):
+        std = 0.02
+        if hasattr(module, 'NANOGPT_SCALE_INIT'):
+            std *= (2 * self.config.n_layer) ** -0.5
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0,  std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
@@ -141,25 +158,54 @@ class DataLoaderLite:
         return x, y
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-train_loader = DataLoaderLite(B=4, T=32)
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+train_loader = DataLoaderLite(B=16, T=256)
 
 
-model = GPT(Config())
-model.eval()
+
+model = GPT(Config(vocab_size=50304))
 model.to(device)
+model = torch.compile(model)
 
+torch.set_float32_matmul_precision('high')
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+    
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+    
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+# optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+for i in range(max_steps):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x = x.to(device)
     y = y.to(device)
     optimizer.zero_grad()
-    logtis, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
+    norm =  torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt =  (t1 - t0)*1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item():.6f}, norm: {norm:.4f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
